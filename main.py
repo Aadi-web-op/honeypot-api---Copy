@@ -4,6 +4,8 @@ import json
 import logging
 import random
 import time
+import base64
+import tempfile
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends
@@ -30,7 +32,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 class Message(BaseModel):
     sender: str
-    text: str
+    text: Optional[str] = ""
+    audioBase64: Optional[str] = None
     timestamp: int
 
 class Metadata(BaseModel):
@@ -231,23 +234,21 @@ PERSONAS = {
     }
 }
 
-# Global Session State for Personas
-session_personas: Dict[str, str] = {}
+# Global Session State
+# Stores: {'persona': str, 'language': str}
+session_state: Dict[str, Dict[str, str]] = {}
 
-def select_persona(text: str) -> str:
-    """Uses Groq to classify the scam and select the best persona."""
+def select_persona_and_language(text: str) -> tuple[str, str]:
+    """Uses Groq to classify the scam and detect language."""
     if not groq_client:
-        return "grandma"
+        return "grandma", "english"
         
     try:
         system_prompt = (
-            "Classify this incoming message into a Scam Category and return ONLY the Persona Key.\n"
-            "Categories mapping:\n"
-            "1. Lottery/Job/Loan/Money Promise -> 'student'\n"
-            "2. Police/Court/Customs/Official -> 'skeptic'\n"
-            "3. Tech Support/Bank/Block/KYC -> 'grandma'\n"
-            "4. General/Unknown -> 'parent'\n"
-            "Return ONLY one word: student, skeptic, grandma, or parent."
+            "Analyze the message. Return strictly in this format: 'PersonaKey|Language'.\n"
+            "1. PersonaKey: student (money/lottery), skeptic (police/official), grandma (tech/bank), parent (general).\n"
+            "2. Language: 'hinglish' (if Hindi words/grammar used) or 'english'.\n"
+            "Example: 'student|hinglish' or 'grandma|english'."
         )
         
         completion = groq_client.chat.completions.create(
@@ -257,22 +258,34 @@ def select_persona(text: str) -> str:
             ],
             model="llama-3.3-70b-versatile",
             temperature=0.1,
-            max_tokens=10
+            max_tokens=20
         )
         
-        selected = completion.choices[0].message.content.strip().lower()
-        # Cleanup
-        for key in PERSONAS.keys():
-            if key in selected:
-                return key
-        return "grandma" # Fallback
+        result = completion.choices[0].message.content.strip().lower()
+        parts = result.split('|')
         
-    except Exception as e:
-        logger.error(f"Persona selection failed: {e}")
-        return "grandma"
+        selected_persona = "grandma"
+        selected_language = "english"
+        
+        if len(parts) >= 1:
+            # simple fuzzy match
+            for p in PERSONAS.keys():
+                if p in parts[0]:
+                    selected_persona = p
+                    break
+        
+        if len(parts) >= 2:
+            if "hinglish" in parts[1] or "hindi" in parts[1]:
+                selected_language = "hinglish"
+                
+        return selected_persona, selected_language
 
-def generate_agent_reply(history: List[Dict[str, str]], current_message: str, known_entities: Dict, persona_key: str = "grandma") -> str:
-    """Generates a response using Groq LLM with the SELECTED persona."""
+    except Exception as e:
+        logger.error(f"Selection failed: {e}")
+        return "grandma", "english"
+
+def generate_agent_reply(history: List[Dict[str, str]], current_message: str, known_entities: Dict, persona_key: str = "grandma", language: str = "english") -> str:
+    """Generates a response using Groq LLM with the SELECTED persona and LANGUAGE."""
     if not groq_client:
         return "I am confused. Can you explain why you need this?"
 
@@ -289,12 +302,23 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
     persona = PERSONAS.get(persona_key, PERSONAS["grandma"])
     base_prompt = persona["prompt"]
     
+    # Language Instruction
+    lang_instruction = ""
+    if language == "hinglish":
+        lang_instruction = (
+            "\nIMPORTANT: The user is speaking Hinglish. Reply in Hinglish (Roman Hindi + English mix). "
+            "Use natural Indian conversational style (e.g., 'Haan bhai', 'Arre sir', 'Nahi ho raha'). "
+            "Do NOT translate technical terms (keep 'bank', 'link', 'app' in English)."
+        )
+    else:
+        lang_instruction = "\nReply in standard English."
+
     strategy_instruction = ""
     if missing_info:
         strategy_instruction = f"\nGOAL: You still need to collect: {', '.join(missing_info)}. Invent a pretext to ask for them."
 
     # Construct system prompt
-    system_prompt = f"{base_prompt} {strategy_instruction}"
+    system_prompt = f"{base_prompt} {lang_instruction} {strategy_instruction}"
     
     messages = [{"role": "system", "content": system_prompt}]
     
@@ -321,7 +345,6 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
 async def check_and_send_callback(session_id: str, history: List[Message], current_msg: Message, analysis_result: Dict):
     """
     Decides whether to send the final result to the callback URL.
-    Logic: Send callback if we have exchanged enough messages OR confirmed scam with high confidence.
     """
     total_messages = len(history) + 1
     
@@ -334,14 +357,16 @@ async def check_and_send_callback(session_id: str, history: List[Message], curre
         aggregated_entities = extract_entities(all_text)
         
         # Log which persona was used
-        persona_used = session_personas.get(session_id, "Unknown")
+        state = session_state.get(session_id, {})
+        persona_used = state.get('persona', 'Unknown')
+        lang_used = state.get('language', 'Unknown')
         
         payload = {
             "sessionId": session_id,
             "scamDetected": True,
             "totalMessagesExchanged": total_messages,
             "extractedIntelligence": aggregated_entities,
-            "agentNotes": f"Scammer detected. Engaged using persona: {persona_used}"
+            "agentNotes": f"Scammer detected. Persona: {persona_used}, Language: {lang_used}"
         }
         
         try:
@@ -351,6 +376,42 @@ async def check_and_send_callback(session_id: str, history: List[Message], curre
         except Exception as e:
             logger.error(f"Failed to send callback: {e}")
 
+def transcribe_audio(base64_audio: str) -> str:
+    """Decodes base64 audio and transcribes it using Groq."""
+    if not groq_client: 
+        return ""
+        
+    try:
+        # Decode base64
+        audio_data = base64.b64decode(base64_audio)
+        
+        # Create temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_audio:
+            temp_audio.write(audio_data)
+            temp_audio_path = temp_audio.name
+            
+        # Transcribe
+        with open(temp_audio_path, "rb") as file:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(temp_audio_path, file.read()),
+                model="distil-whisper-large-v3-en",
+                response_format="json",
+                language="en", 
+                temperature=0.0
+            )
+            
+        # Cleanup
+        try:
+            os.remove(temp_audio_path)
+        except:
+            pass
+            
+        return transcription.text.strip()
+        
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        return ""
+
 @app.post("/analyze")
 async def analyze(
     request: AnalyzeRequest,
@@ -358,6 +419,17 @@ async def analyze(
     api_key: str = Depends(verify_api_key)
 ):
     try:
+        # 0. Handle Audio
+        original_text = request.message.text
+        if request.message.audioBase64 and not original_text:
+            logger.info("Received audio message. Transcribing...")
+            transcribed_text = transcribe_audio(request.message.audioBase64)
+            if transcribed_text:
+                request.message.text = transcribed_text
+                logger.info(f"Transcribed: {transcribed_text}")
+            else:
+                logger.warning("Transcription failed or returned empty.")
+
         current_msg_is_scam = predict_scam(request.message.text)
         has_history = len(request.conversationHistory) > 0
         is_scam = current_msg_is_scam or has_history
@@ -368,18 +440,28 @@ async def analyze(
         agent_reply = "I don't think I am interested. Thank you."
         
         if is_scam:
-            # --- Persona Selection Logic ---
-            assigned_persona = session_personas.get(request.sessionId)
+            # --- Persona & Language Selection Logic ---
+            current_state = session_state.get(request.sessionId)
             
-            if not assigned_persona:
-                # Select based on current message (scammer's opening)
-                assigned_persona = select_persona(request.message.text)
-                session_personas[request.sessionId] = assigned_persona
-                logger.info(f"Session {request.sessionId} assigned persona: {assigned_persona}")
+            if not current_state:
+                # Select based on current message
+                p_key, lang = select_persona_and_language(request.message.text)
+                session_state[request.sessionId] = {
+                    "persona": p_key,
+                    "language": lang
+                }
+                current_state = session_state[request.sessionId]
+                logger.info(f"Session {request.sessionId} assigned: {current_state}")
             
             # --- Generate Reply ---
             history_dicts = [m.dict() for m in request.conversationHistory]
-            agent_reply = generate_agent_reply(history_dicts, request.message.text, all_entities, assigned_persona)
+            agent_reply = generate_agent_reply(
+                history_dicts, 
+                request.message.text, 
+                all_entities, 
+                current_state["persona"],
+                current_state["language"]
+            )
 
         # Schedule Callback
         if is_scam:
