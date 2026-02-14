@@ -110,14 +110,23 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
     
     # Phone: 
     # Broader match: 10 digits starting with 6-9. 
-    # We rely on post-processing to remove it from "banks" rather than strict regex boundaries which might fail on edge cases.
     phone_pattern = r'(?:\+91[\-\s]?)?[6-9]\d{9}'
     
     # Bank Account: 9-18 digits.
     bank_account_pattern = r'\d{9,18}'
+
+    # Indian ID Patterns
+    aadhar_pattern = r'\b\d{4}\s?\d{4}\s?\d{4}\b'  # 12 digits, optional spaces
+    pan_pattern = r'\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b'
+    ifsc_pattern = r'\b[A-Z]{4}0[A-Z0-9]{6}\b'
     
     # Simple keywords for suspicious terms
-    suspicious_keywords_list = ["urgent", "verify", "block", "suspend", "kyc", "pan", "aadhar", "win", "lottery", "expired", "otp", "pin", "cvv", "expiry", "code"]
+    suspicious_keywords_list = [
+        "urgent", "verify", "block", "suspend", "kyc", "pan", "aadhar", 
+        "win", "lottery", "expired", "otp", "pin", "cvv", "expiry", "code",
+        "cbi", "police", "customs", "drugs", "seized", "arrest", "warrant",
+        "electricity", "bill", "disconnect", "prepaid", "task"
+    ]
     found_keywords = list(set([word for word in suspicious_keywords_list if word in text.lower()]))
 
     # Extraction
@@ -125,12 +134,11 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
     urls = re.findall(url_pattern, text)
     phones = re.findall(phone_pattern, text)
     banks = re.findall(bank_account_pattern, text)
+    aadhars = re.findall(aadhar_pattern, text)
+    pans = re.findall(pan_pattern, text)
+    ifscs = re.findall(ifsc_pattern, text)
     
     # Post-processing: Filter overlaps
-    # If a number is in "phones", remove it from "banks"
-    # We need to normalize to check overlaps. 
-    # e.g. Phone "+91-9876543210" vs Bank "9876543210"
-    
     clean_phones = sorted(list(set(phones)))
     
     # Normalize phones for checking against banks (remove +91, -, spaces)
@@ -143,8 +151,8 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
 
     clean_banks = set()
     for b in banks:
-        # Bank account shouldn't be a phone number
-        if b not in normalized_phones:
+        # Bank account shouldn't be a phone number or Aadhar
+        if b not in normalized_phones and len(b) != 12: 
             clean_banks.add(b)
             
     return {
@@ -152,7 +160,10 @@ def extract_entities(text: str) -> Dict[str, List[str]]:
         "upiIds": sorted(list(set(upis))),
         "phishingLinks": sorted(list(set(urls))),
         "phoneNumbers": clean_phones,
-        "suspiciousKeywords": found_keywords
+        "suspiciousKeywords": found_keywords,
+        "aadharNumbers": sorted(list(set(aadhars))),
+        "panNumbers": sorted(list(set(pans))),
+        "ifscCodes": sorted(list(set(ifscs)))
     }
 
 def predict_scam(text: str) -> bool:
@@ -162,19 +173,20 @@ def predict_scam(text: str) -> bool:
         try:
             text_vector = tfidf_vectorizer.transform([text])
             prediction = scam_classifier.predict(text_vector)[0]
-            # Assuming '1' or 'ham'/'spam' labels depending on how it was trained. 
-            # Given the user context "scam_classifier", let's assume it returns a label.
-            # We will treat positive detection as True. 
-            # If the user trained it with "spam", "scam", etc. 
-            # Let's assume prediction is a string label for now and map it.
-            # If it's a binary classifier 0/1, we check that too.
             if str(prediction).lower() in ['scam', 'spam', 'fraud', '1']:
                 return True
         except Exception as e:
             logger.error(f"ML prediction failed: {e}")
     
-    # 2. Fallback to keywords
-    keywords = ["bank", "verify", "blocked", "lottery", "winner", "prize", "urgent", "credit card", "kyc", "update", "otp", "pin", "cvv", "expiry"]
+    # 2. Fallback to keywords (Enhanced for India)
+    keywords = [
+        "bank", "verify", "blocked", "lottery", "winner", "prize", "urgent", 
+        "credit card", "kyc", "update", "otp", "pin", "cvv", "expiry",
+        "cbi", "police", "customs", "narcotics", "seized", "arrest", "warrant", # Digital Arrest
+        "electricity", "disconnect", "meter", # Utility Scam
+        "job", "task", "prepaid", "youtube", "review", # Task Scam
+        "fedex", "courier", "parcel" # Courier Scam
+    ]
     if any(keyword in text.lower() for keyword in keywords):
         return True
         
@@ -246,9 +258,15 @@ def select_persona_and_language(text: str) -> tuple[str, str]:
     try:
         system_prompt = (
             "Analyze the message. Return strictly in this format: 'PersonaKey|Language'.\n"
-            "1. PersonaKey: student (money/lottery), skeptic (police/official), grandma (tech/bank), parent (general).\n"
-            "2. Language: 'hinglish' (if Hindi words/grammar used) or 'english'.\n"
-            "Example: 'student|hinglish' or 'grandma|english'."
+            "Categories mapping:\n"
+            "1. 'student': Lottery, Job, Loan, Money Promise, 'Task' scams (YouTube like/Telegram), 'Prepaid' tasks.\n"
+            "2. 'skeptic': Police, CBI, Customs, Narcotics, 'Digital Arrest', 'Parcel Seized', Courts, Official threats.\n"
+            "3. 'grandma': Tech Support, Bank, KYC, Blocked Account, 'Electricity Bill' disconnect, OTP.\n"
+            "4. 'parent': General spam, unknown, wrongful delivery.\n"
+            "Language Detection:\n"
+            "- 'hinglish': If Hindi words/grammar used (e.g., 'kya', 'hai', 'bhai', 'karo').\n"
+            "- 'english': Standard English.\n"
+            "Example: 'student|hinglish' or 'skeptic|english'."
         )
         
         completion = groq_client.chat.completions.create(
