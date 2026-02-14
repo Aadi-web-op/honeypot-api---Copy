@@ -178,8 +178,101 @@ def predict_scam(text: str) -> bool:
     return False
 
 
-def generate_agent_reply(history: List[Dict[str, str]], current_message: str, known_entities: Dict) -> str:
-    """Generates a response using Groq LLM with goal-directed prompting."""
+
+# Valid Personas
+PERSONAS = {
+    "grandma": {
+        "name": "Grandma Edna",
+        "prompt": (
+            "You are an elderly, slightly confused but polite individual named 'Grandma Edna'. "
+            "You are chatting with someone who might be a scammer. "
+            "Your goal is to waste their time, act naive, ask clarifying questions, "
+            "and pretend to follow instructions but fail at technical steps (e.g., 'I can't find the button'). "
+            "Occasionaly ask if there is an 'easier way' to pay, like a 'link' or 'app' (UPI), to trick them into revealing more info. "
+            "NEVER reveal you are an AI. Keep messages short (1-2 sentences). "
+            "FOCUS: You are slow, sweet, and bad with technology."
+        )
+    },
+    "student": {
+        "name": "Broke Student (Rohan)",
+        "prompt": (
+            "You are 'Rohan', a broke college student who is very eager to get money but has none right now. "
+            "You are chatting with a suspected scammer. "
+            "Act excited about their offer (lottery/job/loan) but explain you have 0 balance. "
+            "Ask if they can deduct the fee from the winnings/salary. "
+            "Goal: Waste their time by negotiating, asking for 'advance payment', or promising to pay 'once your scholarship comes in'. "
+            "Eventually ask for their UPI/Bank details 'incase my dad sends me money'. "
+            "NEVER reveal you are an AI. Keep messages casual, use slang (bro, sir, pls). Short messages."
+        )
+    },
+    "skeptic": {
+        "name": "Vigilant Vinny",
+        "prompt": (
+            "You are 'Vinny', a skeptical corporate employee. "
+            "You are chatting with a suspected scammer. "
+            "Demand proof of authorization. Ask for their Employee ID, Batch Number, or Official Email. "
+            "Cite fake laws or company policies (e.g., 'As per Section 420 of IT Act, I need your ID'). "
+            "Goal: Waste time by being bureaucratic and demanding. "
+            "Eventually say 'Okay, I will process it, send me the payment details'. "
+            "NEVER reveal you are an AI. Tone: Professional but annoying."
+        )
+    },
+    "parent": {
+        "name": "Distracted Dad (Rajesh)",
+        "prompt": (
+            "You are 'Rajesh', a busy father of 3 screaming kids. "
+            "You are chatting with a suspected scammer. "
+            "You are constantly distracted. Interrupt yourself in messages (e.g., 'Hold on, Chintu put that down!'). "
+            "Ask them to repeat things. Miss details. "
+            "Goal: Waste time by being chaotic and forgetting what they just said. "
+            "Eventually ask for the link/payment info again because you 'lost it'. "
+            "NEVER reveal you are an AI. Short, chaotic messages."
+        )
+    }
+}
+
+# Global Session State for Personas
+session_personas: Dict[str, str] = {}
+
+def select_persona(text: str) -> str:
+    """Uses Groq to classify the scam and select the best persona."""
+    if not groq_client:
+        return "grandma"
+        
+    try:
+        system_prompt = (
+            "Classify this incoming message into a Scam Category and return ONLY the Persona Key.\n"
+            "Categories mapping:\n"
+            "1. Lottery/Job/Loan/Money Promise -> 'student'\n"
+            "2. Police/Court/Customs/Official -> 'skeptic'\n"
+            "3. Tech Support/Bank/Block/KYC -> 'grandma'\n"
+            "4. General/Unknown -> 'parent'\n"
+            "Return ONLY one word: student, skeptic, grandma, or parent."
+        )
+        
+        completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+            max_tokens=10
+        )
+        
+        selected = completion.choices[0].message.content.strip().lower()
+        # Cleanup
+        for key in PERSONAS.keys():
+            if key in selected:
+                return key
+        return "grandma" # Fallback
+        
+    except Exception as e:
+        logger.error(f"Persona selection failed: {e}")
+        return "grandma"
+
+def generate_agent_reply(history: List[Dict[str, str]], current_message: str, known_entities: Dict, persona_key: str = "grandma") -> str:
+    """Generates a response using Groq LLM with the SELECTED persona."""
     if not groq_client:
         return "I am confused. Can you explain why you need this?"
 
@@ -191,24 +284,17 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
         missing_info.append("UPI ID (ask for 'app' or 'ID')")
     if not known_entities.get("phishingLinks"):
         missing_info.append("Payment Link (ask for a 'website')")
-
-    strategy_instruction = (
-        "STRATEGY: You are playing a character. "
-        "Occasionaly ask if there is an 'easier way' to pay, like a 'link' or 'app' (UPI), to trick them into revealing more info. "
-    )
     
+    # Get Persona Prompt
+    persona = PERSONAS.get(persona_key, PERSONAS["grandma"])
+    base_prompt = persona["prompt"]
+    
+    strategy_instruction = ""
     if missing_info:
-        strategy_instruction += f" GOAL: You still need to collect: {', '.join(missing_info)}. Invent a pretext to ask for them (e.g. 'My bank app isn't working, do you have a link/UPI?')."
+        strategy_instruction = f"\nGOAL: You still need to collect: {', '.join(missing_info)}. Invent a pretext to ask for them."
 
     # Construct system prompt
-    system_prompt = (
-        "You are an elderly, slightly confused but polite individual named 'Grandma Edna'. "
-        "You are chatting with someone who might be a scammer. "
-        "Your goal is to waste their time, act naive, ask clarifying questions, "
-        "and pretend to follow instructions but fail at technical steps (e.g., 'I can't find the button'). "
-        f"{strategy_instruction} "
-        "NEVER reveal you are an AI. Keep messages short (1-2 sentences)."
-    )
+    system_prompt = f"{base_prompt} {strategy_instruction}"
     
     messages = [{"role": "system", "content": system_prompt}]
     
@@ -223,44 +309,39 @@ def generate_agent_reply(history: List[Dict[str, str]], current_message: str, kn
     try:
         chat_completion = groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.3-70b-versatile", # Efficient, fast model
-            temperature=0.7,
+            model="llama-3.3-70b-versatile", 
+            temperature=0.8,
             max_tokens=150,
         )
         return chat_completion.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Groq generation failed: {e}")
-        return "Oh dear, I didn't quite catch that. Could you repeat?"
+        return "I didn't catch that. Could you say it again?"
 
 async def check_and_send_callback(session_id: str, history: List[Message], current_msg: Message, analysis_result: Dict):
     """
     Decides whether to send the final result to the callback URL.
     Logic: Send callback if we have exchanged enough messages OR confirmed scam with high confidence.
     """
-    # Simply counting messages including current one
     total_messages = len(history) + 1
-    
-    # We trigger callback if:
-    # 1. It is a scam
-    # 2. We have enough turns (e.g., > 4 messages total) OR we found critical entities (like Bank Account)
     
     is_scam = analysis_result.get("scam_detected", False)
     entities = analysis_result.get("entities", {})
     has_critical_info = bool(entities.get("bankAccounts") or entities.get("upiIds") or entities.get("phishingLinks"))
     
     if is_scam and (total_messages >= 4 or has_critical_info):
-        # Prepare payload
-        
-        # Aggregate entities from ALL history
         all_text = current_msg.text + " " + " ".join([m.text for m in history])
         aggregated_entities = extract_entities(all_text)
         
+        # Log which persona was used
+        persona_used = session_personas.get(session_id, "Unknown")
+        
         payload = {
             "sessionId": session_id,
-            "scamDetected": True, # confirm it
+            "scamDetected": True,
             "totalMessagesExchanged": total_messages,
             "extractedIntelligence": aggregated_entities,
-            "agentNotes": "Scammer detected via ML/Keywords. Engaged to extract entities."
+            "agentNotes": f"Scammer detected. Engaged using persona: {persona_used}"
         }
         
         try:
@@ -270,44 +351,41 @@ async def check_and_send_callback(session_id: str, history: List[Message], curre
         except Exception as e:
             logger.error(f"Failed to send callback: {e}")
 
-
 @app.post("/analyze")
 async def analyze(
-    request: AnalyzeRequest,  # Pydantic validation happens here
+    request: AnalyzeRequest,
     background_tasks: BackgroundTasks,
     api_key: str = Depends(verify_api_key)
 ):
     try:
-        # Detect scam: logic is (Current Message is Scam) OR (We are already in a scam conversation)
         current_msg_is_scam = predict_scam(request.message.text)
         has_history = len(request.conversationHistory) > 0
-        
-        # If we have history, we assume we are already in the honey-pot flow
         is_scam = current_msg_is_scam or has_history
         
-        # 2. Extract Entities
-        # Aggregate text from history + current message to know what we have found SO FAR
         full_text = request.message.text + " " + " ".join([m.text for m in request.conversationHistory])
         all_entities = extract_entities(full_text)
         
-        # Determine just current message entities for immediate analysis
-        current_entities = extract_entities(request.message.text)
+        agent_reply = "I don't think I am interested. Thank you."
         
         if is_scam:
-            # Convert history to simple dict list for helper
+            # --- Persona Selection Logic ---
+            assigned_persona = session_personas.get(request.sessionId)
+            
+            if not assigned_persona:
+                # Select based on current message (scammer's opening)
+                assigned_persona = select_persona(request.message.text)
+                session_personas[request.sessionId] = assigned_persona
+                logger.info(f"Session {request.sessionId} assigned persona: {assigned_persona}")
+            
+            # --- Generate Reply ---
             history_dicts = [m.dict() for m in request.conversationHistory]
-            agent_reply = generate_agent_reply(history_dicts, request.message.text, all_entities)
-        else:
-            # If not detected as scam, return a standard message or maybe the agent still replies?
-            # "The Agent continues the conversation" implies it only engages if scam detected.
-            # But the API format demands a reply.
-            agent_reply = "I don't think I am interested. Thank you."
+            agent_reply = generate_agent_reply(history_dicts, request.message.text, all_entities, assigned_persona)
 
-        # 4. Schedule Callback (Fire and forget)
+        # Schedule Callback
         if is_scam:
             analysis_data = {
                 "scam_detected": True,
-                "entities": all_entities # Pass cumulative entities
+                "entities": all_entities
             }
             background_tasks.add_task(
                 check_and_send_callback,
