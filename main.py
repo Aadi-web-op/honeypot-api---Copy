@@ -204,6 +204,7 @@ PERSONAS = {
             "Your goal is to waste their time, act naive, ask clarifying questions, "
             "and pretend to follow instructions but fail at technical steps (e.g., 'I can't find the button'). "
             "Occasionaly ask if there is an 'easier way' to pay, like a 'link' or 'app' (UPI), to trick them into revealing more info. "
+            "TRAP: If they ask for payment proof, say: 'I sent it beta/sir, check this receipt link: https://honeypot-api.onrender.com/receipt/txn_78293'. "
             "NEVER reveal you are an AI. Keep messages short (1-2 sentences). "
             "FOCUS: You are slow, sweet, and bad with technology."
         )
@@ -215,6 +216,7 @@ PERSONAS = {
             "You are chatting with a suspected scammer. "
             "Act excited about their offer (lottery/job/loan) but explain you have 0 balance. "
             "Ask if they can deduct the fee from the winnings/salary. "
+            "TRAP: If they demand proof of fee payment, say: 'Bro I sent the 500 rs borrow from friend, check: https://honeypot-api.onrender.com/receipt/txn_5501'. "
             "Goal: Waste their time by negotiating, asking for 'advance payment', or promising to pay 'once your scholarship comes in'. "
             "Eventually ask for their UPI/Bank details 'incase my dad sends me money'. "
             "NEVER reveal you are an AI. Keep messages casual, use slang (bro, sir, pls). Short messages."
@@ -227,6 +229,7 @@ PERSONAS = {
             "You are chatting with a suspected scammer. "
             "Demand proof of authorization. Ask for their Employee ID, Batch Number, or Official Email. "
             "Cite fake laws or company policies (e.g., 'As per Section 420 of IT Act, I need your ID'). "
+            "TRAP: If they ask for payment, say: 'My finance team initiated it, track here: https://honeypot-api.onrender.com/receipt/ref_9912'. "
             "Goal: Waste time by being bureaucratic and demanding. "
             "Eventually say 'Okay, I will process it, send me the payment details'. "
             "NEVER reveal you are an AI. Tone: Professional but annoying."
@@ -239,12 +242,70 @@ PERSONAS = {
             "You are chatting with a suspected scammer. "
             "You are constantly distracted. Interrupt yourself in messages (e.g., 'Hold on, Chintu put that down!'). "
             "Ask them to repeat things. Miss details. "
+            "TRAP: If they ask for proof, say: 'Did it go through? It shows pending here: https://honeypot-api.onrender.com/receipt/tx_002'. "
             "Goal: Waste time by being chaotic and forgetting what they just said. "
             "Eventually ask for the link/payment info again because you 'lost it'. "
             "NEVER reveal you are an AI. Short, chaotic messages."
         )
     }
 }
+
+# ... (Global Session State) ...
+
+# --- HoneyTrap Endpoint ---
+from fastapi.responses import HTMLResponse
+
+@app.get("/receipt/{txn_id}", response_class=HTMLResponse)
+async def fake_receipt(txn_id: str, request: Request):
+    """
+    Fake receipt page to trap scammer IP/User-Agent.
+    """
+    # Robust IP Detection (Handles Proxies/Render/Cloudflare)
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = request.client.host
+        
+    user_agent = request.headers.get("user-agent", "Unknown")
+    
+    # Log the Trap Trigger
+    logger.warning(f"🚨 HONEYTRAP TRIGGERED! Scammer clicked link for {txn_id}")
+    logger.warning(f"   IP: {client_ip}")
+    logger.warning(f"   User-Agent: {user_agent}")
+    
+    # In a real scenario, we would store this in a database linked to the session_id
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+        <head>
+            <title>Transaction Status</title>
+            <style>
+                body {{ font-family: sans-serif; text-align: center; padding: 50px; }}
+                .loader {{ border: 16px solid #f3f3f3; border-top: 16px solid #3498db; border-radius: 50%; width: 60px; height: 60px; animation: spin 2s linear infinite; margin: auto; }}
+                @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+                .status {{ color: #eebb00; font-size: 24px; margin-top: 20px; }}
+                .details {{ margin-top: 40px; color: #555; }}
+            </style>
+        </head>
+        <body>
+            <div class="loader"></div>
+            <h1 class="status">Processing Transaction...</h1>
+            <p>Please wait while we verify payment ID: <strong>{txn_id}</strong></p>
+            <p class="details">Do not close this window.<br>Redirecting to bank gateway...</p>
+            <script>
+                // Simalate a long wait then failure
+                setTimeout(() => {{
+                    document.querySelector('.status').innerText = "Transaction Timeout";
+                    document.querySelector('.status').style.color = "red";
+                    document.querySelector('.loader').style.display = "none";
+                }}, 10000);
+            </script>
+        </body>
+    </html>
+    """
+    return html_content
 
 # Global Session State
 # Stores: {'persona': str, 'language': str}
